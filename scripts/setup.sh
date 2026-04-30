@@ -62,30 +62,30 @@ log "Partition will be: $partition_path"
 
 step "Installing required packages"
 dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
-dnf install -y samba samba-client ntfs-3g ntfsprogs inotify-tools net-tools \
+dnf install -y samba samba-client xfsprogs inotify-tools net-tools \
                parted policycoreutils-python-utils firewalld
 
 # Skip the destructive partition/format step if the target partition already
-# holds an NTFS filesystem. Lets the script be rerun without wiping /samba.
+# holds an XFS filesystem. Lets the script be rerun without wiping /samba.
 needs_format=1
 if [[ -b $partition_path ]]; then
     existing_fs=$(blkid -s TYPE -o value "$partition_path" 2>/dev/null || true)
-    if [[ $existing_fs == "ntfs" ]]; then
+    if [[ $existing_fs == "xfs" ]]; then
         needs_format=0
     fi
 fi
 
 if (( needs_format )); then
-    step "Creating NTFS partition on /dev/$disk_name"
+    step "Creating XFS partition on /dev/$disk_name"
 
     if mountpoint -q /samba; then
         log "/samba is currently mounted, unmounting..."
         umount /samba
     fi
 
-    log "Writing GPT label and primary NTFS partition"
+    log "Writing GPT label and primary XFS partition"
     parted -s "/dev/$disk_name" mklabel gpt
-    parted -s "/dev/$disk_name" mkpart primary ntfs 0% 100%
+    parted -s "/dev/$disk_name" mkpart primary xfs 0% 100%
 
     partprobe "/dev/$disk_name" || true
     udevadm settle || true
@@ -98,16 +98,16 @@ if (( needs_format )); then
     done
     [[ -b $partition_path ]] || die "Partition $partition_path did not appear after partprobe"
 
-    log "Formatting $partition_path as NTFS"
-    mkfs.ntfs -f "$partition_path"
+    log "Formatting $partition_path as XFS"
+    mkfs.xfs -f "$partition_path"
 else
-    step "Reusing existing NTFS partition at $partition_path"
+    step "Reusing existing XFS partition at $partition_path"
 fi
 
 mkdir -p /samba
 
 step "Ensuring /samba is in /etc/fstab and mounted"
-fstab_line="$partition_path /samba ntfs defaults,noexec,uid=nobody,gid=nobody,fmask=0111,dmask=0000,context=system_u:object_r:samba_share_t:s0 0 0"
+fstab_line="$partition_path /samba xfs defaults,noexec,context=system_u:object_r:samba_share_t:s0 0 0"
 
 if ! grep -qxF "$fstab_line" /etc/fstab; then
     if grep -qE '[[:space:]]/samba[[:space:]]' /etc/fstab; then
@@ -144,6 +144,15 @@ map archive = no
 map system = no
 map hidden = no
 store dos attributes = yes
+change notify = yes
+kernel change notify = yes
+stat cache = no
+name cache timeout = 0
+getwd cache = no
+oplocks = no
+level2 oplocks = no
+smb2 leases = no
+smb3 directory leases = no
 printing = bsd
 printcap name = /dev/null
 disable spoolss = yes
@@ -178,6 +187,15 @@ map archive = no
 map system = no
 map hidden = no
 store dos attributes = yes
+change notify = yes
+kernel change notify = yes
+stat cache = no
+name cache timeout = 0
+getwd cache = no
+oplocks = no
+level2 oplocks = no
+smb2 leases = no
+smb3 directory leases = no
 printing = bsd
 printcap name = /dev/null
 disable spoolss = yes
@@ -242,8 +260,9 @@ EOF
 done
 
 systemctl daemon-reload
-systemctl enable --now samba-legacy
-systemctl enable --now samba-office
+systemctl enable samba-legacy samba-office
+# Restart (not start) so config changes on re-runs actually take effect.
+systemctl restart samba-legacy samba-office
 
 step "Configuring Samba users"
 
@@ -282,6 +301,15 @@ ensure_smb_user() {
 legacy_password=$(ensure_smb_user legacy legacy_user)
 office_password=$(ensure_smb_user office office_user)
 
+# XFS uses real Unix perms (unlike the old ntfs-3g uid=nobody), so restrict
+# each share directory to its user. The copy service runs as root and can
+# cross the boundary; ordinary Samba connections cannot.
+step "Setting ownership on share folders"
+chown office_user:office_user /samba/office
+chmod 700 /samba/office
+chown legacy_user:legacy_user /samba/legacy
+chmod 700 /samba/legacy
+
 step "Configuring firewall"
 systemctl enable --now firewalld
 
@@ -293,8 +321,116 @@ firewall-cmd --permanent --zone=office_net --change-interface="$office_iface"
 
 firewall-cmd --permanent --zone=legacy_net --add-service=samba
 firewall-cmd --permanent --zone=office_net --add-service=samba
+firewall-cmd --permanent --zone=office_net --add-service=ssh
 
 firewall-cmd --reload
+
+step "Installing file-move service (office legacy)"
+
+SYNC_SCRIPT=/usr/local/bin/samba-share-bridge-move
+SYNC_SERVICE=/etc/systemd/system/samba-share-bridge-move.service
+
+cat > "$SYNC_SCRIPT" <<'SYNC_EOF'
+#!/usr/bin/env bash
+# Moves finished files between /samba/office and /samba/legacy. The source file
+# disappears and the destination appears atomically on the same XFS filesystem.
+set -uo pipefail
+
+OFFICE=/samba/office
+LEGACY=/samba/legacy
+
+log() { printf '%s %s\n' "$(date -Is)" "$*"; }
+
+[[ -d $OFFICE ]] || { log "FATAL: $OFFICE does not exist"; exit 1; }
+[[ -d $LEGACY ]] || { log "FATAL: $LEGACY does not exist"; exit 1; }
+
+move_one() {
+    local src_root=$1 dst_root=$2 owner=$3 group=$4 src=$5
+    local rel=${src#"$src_root/"}
+    local dst="$dst_root/$rel"
+    local dst_dir before after
+
+    # File may have been quarantined by Defender RTP or removed by the writer.
+    [[ -f $src ]] || { log "skip (gone): $rel"; return 0; }
+
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        before=$(stat -c '%s:%Y' "$src" 2>/dev/null) || return 0
+        sleep 1
+        after=$(stat -c '%s:%Y' "$src" 2>/dev/null) || return 0
+        [[ $before == "$after" ]] && break
+    done
+    if [[ $before != "$after" ]]; then
+        log "copy failed: $rel (still changing after wait)"
+        return 0
+    fi
+
+    dst_dir=$(dirname "$dst")
+    mkdir -p "$dst_dir"
+    chown "$owner:$group" "$dst_dir" 2>/dev/null || true
+    chmod 770 "$dst_dir" 2>/dev/null || true
+
+    if mv -f "$src" "$dst" 2>/dev/null; then
+        chown "$owner:$group" "$dst" 2>/dev/null || true
+        chmod 660 "$dst" 2>/dev/null || true
+        touch "$dst" 2>/dev/null || true
+        log "moved: $src_root -> $dst_root: $rel"
+    else
+        log "move failed: $rel (possibly locked)"
+    fi
+}
+
+move_event() {
+    local event=$1 path=$2
+
+    if [[ $event == *DELETE* || $event == *MOVED_FROM* ]]; then
+        return 0
+    elif [[ -d $path ]]; then
+        return 0
+    elif [[ $path == "$OFFICE/"* ]]; then
+        move_one "$OFFICE" "$LEGACY" legacy_user legacy_user "$path"
+    elif [[ $path == "$LEGACY/"* ]]; then
+        move_one "$LEGACY" "$OFFICE" office_user office_user "$path"
+    else
+        log "skip (outside shares): $path"
+    fi
+}
+
+log "watching $OFFICE and $LEGACY for move transfers"
+while true; do
+    event_line=$(inotifywait -r -q --format '%e|%w%f' \
+        -e close_write,moved_to "$OFFICE" "$LEGACY" 2>/dev/null || true)
+    if [[ -n $event_line ]]; then
+        move_event "${event_line%%|*}" "${event_line#*|}"
+    fi
+done
+SYNC_EOF
+chmod 755 "$SYNC_SCRIPT"
+
+cat > "$SYNC_SERVICE" <<EOF
+[Unit]
+Description=Bidirectionally move files between /samba/office and /samba/legacy
+After=samba-legacy.service samba-office.service
+ConditionPathIsMountPoint=/samba
+
+[Service]
+Type=simple
+ExecStart=$SYNC_SCRIPT
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl disable --now samba-office-to-legacy-sync.service >/dev/null 2>&1 || true
+systemctl disable --now samba-office-to-legacy-copy.service >/dev/null 2>&1 || true
+systemctl disable --now samba-share-bridge-copy.service >/dev/null 2>&1 || true
+systemctl enable samba-share-bridge-move.service
+systemctl restart samba-share-bridge-move.service
+ok "Move service running (journalctl -u samba-share-bridge-move -f to watch)"
 
 echo
 ok "Setup complete."

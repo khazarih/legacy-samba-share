@@ -17,7 +17,7 @@ This project implements a secure file sharing solution using Samba. A Red Hat 9.
     - `samba-office`: SMB3-only, serves `/samba/office`, authenticated with `office_user`
     - `samba-legacy`: NT1/SMB1-only, serves `/samba/legacy`, authenticated with `legacy_user`
 *   **No-Execute Enforcement**:
-    - Filesystem-level protection using an NTFS partition mounted.
+    - Filesystem-level protection using an XFS partition mounted with `noexec`.
     - Samba-level protection using `acl allow execute always = no` and restrictive file masks.
 *   **User Isolation**: Dedicated system users for each share with restricted permissions.
 
@@ -45,12 +45,13 @@ This project implements a secure file sharing solution using Samba. A Red Hat 9.
     ```
 
     The script will:
-    - Install required packages (Samba, NTFS tools, firewall, etc.)
-    - Create and format the NTFS partition
+    - Install required packages (Samba, XFS tools, firewall, inotify tools, etc.)
+    - Create and format the XFS partition
     - Mount it at `/samba`
     - Create `office` and `legacy` share directories
     - Configure separate Samba services for each network
     - Set up firewall zones and restrict services per interface
+    - Install a systemd service that bidirectionally moves completed files between the office and legacy shares
     - Generate random passwords for `office_user` and `legacy_user`
     - Output the credentials for both shares
 
@@ -64,6 +65,3 @@ This project implements a secure file sharing solution using Samba. A Red Hat 9.
     - Connect from the legacy client to `\\<red_hat_ip>\legacy` using `legacy_user`.
     - Test file reading and writing on both shares.
     - Verify that executable files cannot be executed from either share (no-execute protection).
-
-# ToDo
-- Implement automatic file copy between shares 
